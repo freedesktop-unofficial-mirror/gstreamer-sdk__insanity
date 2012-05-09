@@ -78,7 +78,6 @@ class SQLiteStorage(DBStorage):
                 self._lock.release()
         return cur.lastrowid
 
-
     def _getDatabaseSchemeVersion(self):
         """
         Returns the scheme version of the currently loaded databse
@@ -106,7 +105,6 @@ class SQLiteStorage(DBStorage):
         ORDER BY name;
         """
         return [x[0] for x in self.con.execute(checktables).fetchall()]
-
 
     def _getDBScheme(self):
         return DB_SCHEME
