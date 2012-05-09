@@ -237,3 +237,4 @@ CREATE INDEX tc_of_dict_c_idx ON testclassinfo_outputfiles_dict (containerid, na
 
 CREATE INDEX test_type_idx ON test (type);
 """
+
