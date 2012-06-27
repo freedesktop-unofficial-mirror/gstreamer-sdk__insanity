@@ -87,7 +87,15 @@ class Test(gobject.GObject):
         "expected-failures": {
             "global": False,
             "description": "List of expected failing checkpoints",
-            "full_description": "Comma separated string of expected failing checkpoints",
+            "full_description": """ Must be of the form:
+            [{
+                "arguments": {argname: [broken_value, ...], ...},
+                "results": {checkitemname: ['0' or 'None'], ...}
+             },
+            ...],
+            If the test's arguments all match values in arguments, and the
+            result of the check matches one in "results", mark the failure as
+            expected.""",
             "type": "s",
             "default_value": None
         }
@@ -104,10 +112,13 @@ class Test(gobject.GObject):
 
     __test_checklist__ = {
         "test-started": {
+            "global": False,
             "description": "The test started"},
         "no-timeout": {
+            "global": False,
             "description": "The test didn't timeout"},
         "no-unexpected-failures": {
+            "global": False,
             "description": "All failed checks were expected."},
         }
     """
@@ -365,15 +376,31 @@ class Test(gobject.GObject):
             self._monitorinstances.append(instance)
         return True
 
+    def tearDownVmethod(self):
+        """
+        Virtual method for subclasses to implement teardown
+
+        You should chain up to the parent function at the BEGINNING
+        of your method
+        """
+        pass
+
     def tearDown(self):
         """
         Clear test
 
-        If you implement this method, you need to chain up to the
-        parent class' tearDown() at the END of your method.
+        Subclassed should not implement this method directly but rather
+        the tearDownVmethod instead
 
         Your teardown MUST happen in a synchronous fashion.
         """
+
+        # Tell monitors that we are starting the teardown process
+        for instance in self._monitorinstances:
+            instance.prepareTearDown()
+
+        self.tearDownVmethod()
+
         stoptime = time.time()
         if self._asynctimeoutid:
             gobject.source_remove(self._asynctimeoutid)
@@ -395,8 +422,11 @@ class Test(gobject.GObject):
                   stoptime, self._teststarttime)
             self.extraInfo("test-total-duration",
                            int((stoptime - self._teststarttime) * 1000))
+
+        # Finaly clear monitors
         for instance in self._monitorinstances:
             instance.tearDown()
+
         self.emit("done")
 
     def stop(self):
@@ -416,11 +446,24 @@ class Test(gobject.GObject):
             self._testtimeoutid = 0
             notimeout = True
         self.validateChecklistItem("no-timeout", notimeout)
+        self._stopMonitors()
+        self.emit("stop", self._iteration)
+
         self.iteration_checklist[self._iteration] = self._checklist
         self.iteration_extrainfo[self._iteration] = self._extrainfo
         self.iteration_outputfiles[self._iteration] = self._outputfiles
         self.iteration_success_percentage[self._iteration] = self.getSuccessPercentage()
-        self.emit("stop", self._iteration)
+
+    def _stopMonitors(self):
+        for monitorinstance in self._monitorinstances:
+            if not monitorinstance.stop():
+                info("Could not stop monitor %s", monitorinstance)
+                continue
+
+            ofiles =  monitorinstance.getIterationOutputFiles(self._iteration)
+            if ofiles:
+                self.iteration_outputfiles.update(ofiles)
+
 
     def start(self):
         """
@@ -435,6 +478,7 @@ class Test(gobject.GObject):
         # Upon first start, we save checklist, etc so they can be copied
         # as base for each successive iteration, while keeping the state
         # acquired in setup
+        self._startMonitors()
         if self._iteration == 1:
             self._base_checklist = self._checklist[:]
             self._base_extrainfo = self._extrainfo.copy()
@@ -455,11 +499,27 @@ class Test(gobject.GObject):
         self._running = True
         self.emit("start", self._iteration)
         self.validateChecklistItem("test-started")
+        if self._iteration > 1:
+            iteraction_checklist = self.getIterationCheckList(self._iteration - 1, False)
+            for item, value in self.getFullCheckList().iteritems():
+                if value.get("global", False):
+                    for name, res in iteraction_checklist:
+                        if item == name:
+                            self.validateChecklistItem(name, res)
+                            break
+
         # start timeout for test !
         self._testtimeouttime = time.time() + self._timeout
         self._testtimeoutid = gobject.timeout_add(self._timeout * 1000,
                                                   self._testTimeoutCb)
         self.test()
+
+    def _startMonitors(self):
+        for monitorinstance in self._monitorinstances:
+            if not monitorinstance.start(self._iteration):
+                info("Could not start monitor %s", monitorinstance)
+                return False
+        return True
 
     def test(self):
         """
@@ -498,7 +558,6 @@ class Test(gobject.GObject):
             if explanation is not None:
                 self._error_explanations[checkitem] = explanation
 
-        #self._checklist[checkitem] = True
         self.emit("check", checkitem, validated)
 
     def isExpectedFailure(self, checkitem, extra_info):
@@ -527,6 +586,8 @@ class Test(gobject.GObject):
                         break
                 else:
                     return True
+            else:
+                return True
 
         return False
 
@@ -605,7 +666,7 @@ class Test(gobject.GObject):
                 break
         return dc
 
-    def getIterationCheckList(self,iteration):
+    def getIterationCheckList(self, iteration, warn=True):
         """
         Returns the instance checklist as a list of tuples of:
         * checkitem name
@@ -636,8 +697,9 @@ class Test(gobject.GObject):
                     d[k] = self.SKIPPED
 
         if unexpected_failures:
-            warning("The following tests failed unexpectedly: %s",
-                    unexpected_failures)
+            if warn:
+                warning("The following tests failed unexpectedly: %s",
+                        unexpected_failures)
             d["no-unexpected-failures"] = 0
 
         return d.items()
@@ -674,7 +736,7 @@ class Test(gobject.GObject):
         for iteration in self.iteration_checklist:
             ckl = self.getIterationCheckList(iteration)
             nbitems = len(self._possiblechecklist)
-            nbsucc = len([item for item, val in ckl if val == True])
+            nbsucc = len([item for item, val in ckl if val >= 1])
             total_nbitems = total_nbitems + nbitems
             total_nbsucc = total_nbsucc + nbsucc
         if total_nbitems == 0:
@@ -784,6 +846,9 @@ class Test(gobject.GObject):
         Returns None if no explanation is available.
         """
         return self.getFullCheckList().get(checkitem, None).get("likely_error", None)
+
+    def getFullCheckList(self):
+        raise NotImplementedError
 
     def getTestName(self):
         return self.__test_name__

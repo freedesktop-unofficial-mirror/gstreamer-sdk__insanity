@@ -44,7 +44,6 @@ information, run extra analysis, etc...
 # * can modify timeout (i.e. with valgrind)
 
 import os
-import os.path
 import subprocess
 from insanity.test import Test, DBusTest
 from insanity.log import warning, debug, info, exception
@@ -106,6 +105,8 @@ class Monitor(object):
         self._checklist = {}
         self._extraInfo = {}
         self._outputfiles = {}
+        self._iteration = 0
+        self._iteration_outputfiles = {}
 
     def setUp(self):
         """
@@ -117,6 +118,34 @@ class Monitor(object):
         their implementation.
         """
         return True
+
+    def start(self, iteration):
+        """
+        Prepare the monitor.
+
+        Returns True if everything went well, else False.
+
+        Sub-classes should call their parent-class start() before
+        their implementation.
+        """
+        self._iteration = iteration
+        return True
+
+    def stop(self):
+        """
+        Stop the monitor.
+
+        Sub-classes should call their parent-class stop() before
+        their implementation.
+        """
+        return True
+
+    def prepareTearDown(self):
+        """
+        This method is called between the last iteration call of stop and finallize
+        the teardown with tearDown
+        """
+        pass
 
     def tearDown(self):
         """
@@ -161,6 +190,29 @@ class Monitor(object):
         """
         debug("%s : %r", key, value)
         self._extraInfo[key] = value
+
+    def addIterationOutputFile(self, key, value):
+        """
+        Report the location of an output file for a specific iteration
+        """
+        debug("%s : %s", key, value)
+        try:
+            self._iteration_outputfiles[self._iteration][key] = value
+        except KeyError:
+            kv = {}
+            kv[key] = value
+            self._iteration_outputfiles[self._iteration] = kv
+
+    def getIterationOutputFiles(self, iteration):
+        """
+        Return a dictionnary containing the outputfiles in the form of
+        {outputfile-name: /path/to/file} for a specific iteration
+        """
+        try:
+            return self._iteration_outputfiles[iteration]
+        except KeyError:
+            debug("No outputfile for iteration %s", iteration)
+            return None
 
     def setOutputFile(self, key, value):
         """
@@ -438,3 +490,173 @@ class GDBMonitor(Monitor):
             if fname == "core.%d" % self.test._pid:
                 return os.path.join(cwd, fname)
         return None
+
+class TerminalRedirectionMonitor(Monitor):
+    """
+    Redirects stderr and stdout of a given test to a file
+    """
+    __monitor_name__ = "output-redirection-monitor"
+    __monitor_description__ = """
+    Redirects stderr and stdout of a given test to a file
+    """
+    __monitor_arguments__ = {
+        "desc":"How to save stderr/stdout. Possible values are 'stderr', only"
+        " is saved in the stderr-file, 'stdout', only stdout is saved in the"
+        " stdout-file outptufile, 'stderr,stdout' both files are saved."
+        " Note that by default both are saved in the stdout-and-stderr-file"
+        " output file",
+        "outputfile-basename":"The category of outputfiles (default='')",
+        "category":"The category of outputfiles (default='insanity-output')",
+        "compress-outputfiles":"Whether the resulting output should be compressed (default:True)"
+        }
+    __monitor_output_files__ = {
+        "glob-stdout-and-stderr-file":"File with both stderr and stdout used between"
+            " setup and first start iteration and last stop and teardown",
+        "glob-stdout-file":"File with stdout used between setup and first start "
+            "iteration and last stop and teardown",
+        "glob-stderr-file":"File with stderr used between setup and first start"
+            " iteration and last stop and teardown",
+        "stdout-and-stderr-file":"File with both stderr and stdout",
+        "stdout-file":"File with stdout only",
+        "stderr-file":"File with stderr only",
+        }
+    __applies_on__ = DBusTest
+
+    def setUp(self):
+        Monitor.setUp(self)
+        self._files, self._paths = self._start()
+        for desc, path in self._paths.iteritems():
+            self.setOutputFile("glob-" + desc, self._compressFile(path, False))
+        self._it_files = []
+        self._it_paths = []
+
+        return True
+
+    def _start(self):
+        desc = self.arguments.get("desc")
+        basename = self.arguments.get("outputfile-basename")
+        category = self.arguments.get("category")
+
+        files = []
+        paths = {}
+        if desc:
+            info("No path set, trying to use stdout and stding specific files")
+            if not 'stderr' in desc and not 'stdout' in desc:
+                warning("Neither of stdout-path, stderr-path and path specified"
+                        "Can not use the monitor")
+                return False
+
+            if 'stderr' in desc:
+                if basename is None:
+                    nameid = "stderr"
+                else:
+                    nameid = basename
+
+                if category:
+                    stderr_file, stderr_path = self.testrun.get_temp_file(nameid=nameid, category=category)
+                else:
+                    stderr_file, stderr_path = self.testrun.get_temp_file(nameid=nameid)
+
+                self.test.setStderr(stderr_file)
+                files.append(stderr_file)
+                paths["stderr-file"] = stderr_path
+
+            if 'stdout' in desc:
+                if basename is None:
+                    nameid = "stdout"
+                else:
+                    nameid = basename
+                if category:
+                    stdout_file, stdout_path = self.testrun.get_temp_file(nameid=nameid, category=category)
+                else:
+                    stdout_file, stdout_path = self.testrun.get_temp_file(nameid=nameid)
+
+                self.test.setStdout(stdout_file)
+                files.append(stdout_file)
+                paths["stdout-file"] = stdout_path
+        else:
+            if basename is None:
+                nameid = "stdoutanderr"
+            else:
+                nameid = basename
+
+            if category:
+                _file, path = self.testrun.get_temp_file(nameid=nameid, category=category)
+            else:
+                _file, path = self.testrun.get_temp_file(nameid=nameid)
+
+            self.test.setStdOutAndErr(path)
+            files.append(_file)
+            paths["stdout-and-stderr-file"] = path
+
+        return files, paths
+
+    def start(self, iteration):
+        Monitor.start(self, iteration)
+        self._it_files, self._it_paths = self._start()
+        return True
+
+    def stop(self):
+        Monitor.stop(self)
+        for f in self._it_files:
+            os.close(f)
+        self._stop(self._it_paths)
+
+    def _compressFile(self, path, for_real=True):
+        """
+        Compress @path if needed and return the new path
+        if @for_real is False, just return the path where
+        the file will land when compressed.
+        """
+        res = path
+        if self.arguments.get("compress", True):
+
+            if not res.endswith(".gz"):
+                res = path + ".gz"
+            if not for_real:
+                return res
+
+            debug("compressing debug log to %s", res)
+            compress_file(path, res)
+            os.remove(path)
+
+        return res
+
+    def _stop(self, paths):
+        for desc, path in paths.iteritems():
+            if not os.path.getsize(path):
+                # if log file is empty remove it
+                debug("log file is empty, removing it")
+                os.remove(path)
+            else:
+                path = self._compressFile(path)
+                self.addIterationOutputFile(desc, path)
+
+        # Add global outputfiles
+        for desc, path in self.getOutputFiles().iteritems():
+            self.addIterationOutputFile(desc, self._compressFile(path, False))
+
+        return True
+
+    def prepareTearDown(self):
+        Monitor.prepareTearDown(self)
+        # We use the same file between setUp and start as
+        # after last stop and the real tearDown
+        for desc, path in self._paths.iteritems():
+            if desc == "stderr-file":
+                self.test.setStderr(path)
+            elif desc == "stdout-file":
+                self.test.setStdout(path)
+            elif desc == "stdout-and-stderr-file":
+                self.test.setStdOutAndErr(path)
+
+    def tearDown(self):
+        Monitor.tearDown(self)
+        for f in self._files:
+            os.close(f)
+
+        for desc, path in self._paths.iteritems():
+            self._compressFile(path)
+
+def getMonitorClass(classname):
+    return eval(classname)

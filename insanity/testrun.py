@@ -41,10 +41,22 @@ import dbus.gobject_service
 import tempfile
 import os
 from insanity.log import error, warning, debug, info
-from insanity.test import Test, PythonDBusTest
+from insanity.test import PythonDBusTest
 from insanity.arguments import Arguments
 import insanity.environment as environment
 import insanity.dbustools as dbustools
+
+from xml.etree.ElementTree import parse
+from insanity.utils import get_test_metadata
+
+from insanity.monitor import getMonitorClass
+from insanity.generator import Generator
+
+# Not directly used but necessary for eval()
+from insanity.generators.filesystem import FileSystemGenerator, URIFileSystemGenerator
+from insanity.generators.playlist import PlaylistGenerator
+from insanity.generators.external import ExternalGenerator
+from insanity.generators.constant import ConstantGenerator, ConstantListGenerator
 
 ##
 ## TODO/FIXME
@@ -52,6 +64,7 @@ import insanity.dbustools as dbustools
 ## Add possibility to add/modify/remove env variables
 ##   This will be needed to run test with different environments
 ##   WITHOUT having to restart the daemon.
+
 
 class TestRun(gobject.GObject):
     """
@@ -68,33 +81,33 @@ class TestRun(gobject.GObject):
     Access to the TestRun from test instances will be possible via DBus IPC.
     """
     __gsignals__ = {
-        "start" : (gobject.SIGNAL_RUN_LAST,
+        "start": (gobject.SIGNAL_RUN_LAST,
                    gobject.TYPE_NONE,
                    ()),
-        "done" : (gobject.SIGNAL_RUN_LAST,
+        "done": (gobject.SIGNAL_RUN_LAST,
                    gobject.TYPE_NONE,
                    ()),
-        "aborted" : (gobject.SIGNAL_RUN_LAST,
+        "aborted": (gobject.SIGNAL_RUN_LAST,
                    gobject.TYPE_NONE,
                    ( )),
         # a test started/ended
         # Warning, it is not automatically a SingleTest
-        "single-test-done" : (gobject.SIGNAL_RUN_LAST,
+        "single-test-done": (gobject.SIGNAL_RUN_LAST,
                               gobject.TYPE_NONE,
                               (gobject.TYPE_PYOBJECT, )),
-        "single-test-start" : (gobject.SIGNAL_RUN_LAST,
+        "single-test-start": (gobject.SIGNAL_RUN_LAST,
                               gobject.TYPE_NONE,
                               (gobject.TYPE_PYOBJECT, gobject.TYPE_INT)),
-        "single-test-stop" : (gobject.SIGNAL_RUN_LAST,
+        "single-test-stop": (gobject.SIGNAL_RUN_LAST,
                               gobject.TYPE_NONE,
                               (gobject.TYPE_PYOBJECT, gobject.TYPE_INT)),
 
         # new-remote-test (uuid)
         #  emitted when a new test has appeared on the private bus
-        "new-remote-test" : (gobject.SIGNAL_RUN_LAST,
+        "new-remote-test": (gobject.SIGNAL_RUN_LAST,
                              gobject.TYPE_NONE,
                              (gobject.TYPE_STRING, )),
-        "removed-remote-test" : (gobject.SIGNAL_RUN_LAST,
+        "removed-remote-test": (gobject.SIGNAL_RUN_LAST,
                                  gobject.TYPE_NONE,
                                  (gobject.TYPE_STRING, ))
         }
@@ -113,10 +126,11 @@ class TestRun(gobject.GObject):
         self._dbusiface = None
         self._setupPrivateBus()
 
-        self._tests = [] # list of (test, arguments, monitors)
+        self._tests = [] # list of (test, arguments, monitors, kwargs)
         self._storage = None
         self._currenttest = None
         self._currentmonitors = None
+        self._currentkwargs = None
         self._currentarguments = None
         self._runninginstances = []
         self._maxnbtests = maxnbtests
@@ -159,7 +173,7 @@ class TestRun(gobject.GObject):
         """
         self._storage = storage
 
-    def addTest(self, test, arguments, monitors=None):
+    def addTest(self, test, arguments, monitors=None, kwargs={}):
         """
         Adds test with the given arguments (or generator) and monitors
         to the list of tests to be run
@@ -177,7 +191,8 @@ class TestRun(gobject.GObject):
             arguments = Arguments(**arguments)
         elif not isinstance(arguments, Arguments):
             raise TypeError("Test arguments need to be of type Arguments or dict")
-        self._tests.append((test, arguments, monitors))
+
+        self._tests.append((test, arguments, monitors, kwargs))
 
     def getEnvironment(self):
         """
@@ -256,9 +271,9 @@ class TestRun(gobject.GObject):
         # grab the next arguments
         testclass = self._currenttest
         monitors = self._currentmonitors
+        kwargs= self._currentkwargs
 
         # create test with arguments
-        kwargs={}
         debug("Creating test %r with arguments %r" % (testclass, kwargs))
         test = PythonDBusTest(testrun=self, bus=self._bus,
                          bus_address=self._bus_address,
@@ -304,10 +319,11 @@ class TestRun(gobject.GObject):
 
         info("Getting next test batch")
         # pop out the next batch
-        test, args, monitors = self._tests.pop(0)
+        test, args, monitors, kwargs = self._tests.pop(0)
         self._currenttest = test
         self._currentmonitors = monitors
         self._currentarguments = args
+        self._currentkwargs = kwargs
 
         info("Current test : %r" % test)
         info("Current monitors : %r" % monitors)
@@ -381,6 +397,7 @@ class TestRun(gobject.GObject):
 
 gobject.type_register(TestRun)
 
+
 class ListTestRun(TestRun):
     """
     Convenience class to specify a list of tests that will be run
@@ -396,6 +413,124 @@ class ListTestRun(TestRun):
         TestRun.__init__(self, *args, **kwargs)
         for test in tests:
             self.addTest(test, arguments, monitors)
+
+
+class XmlTestRun(TestRun):
+    """
+    Convenience class to create a list of tests from an xml file.
+
+    Example of an xml file content:
+
+    <insanity-tests>
+        <monitors>
+          <monitor name="gdb-monitor" type="GDBMonitor" args="'gdb-script' : '$gdbscriptfile'" />
+        </monitors>
+        <test name="exmple-test">
+            <occurrence>
+                <argument name="argument-name" type="GeneratorClasseName" args="List of argument to pass to the GeneratorClasseName constructor">
+                <argument name="decoder-name" type="ConstantGenerator" args="constant='theoradec'"/>
+            </occurrence>
+            <occurrence>
+              <argument name="location" type="ExternalGenerator" args="command='find $basedir -xtype f -name *Vorbis*', max_length=30" />
+              <argument name="decoder-name" type="ConstantGenerator" args="constant='vorbisdec'" />
+            </occurrence>
+        </test>
+        <test name="another-test">
+            <!-- Some other tests -->
+        </test>
+    </insanity-tests>
+    """
+
+    def __init__(self, xmlpath, workingdir, substitutes={}):
+        """
+        Creates a testrun base on the content of @xmlpath
+        """
+        TestRun.__init__(self, maxnbtests=1, workingdir=workingdir)
+        self.substitutes = substitutes
+        self._root = parse(xmlpath)
+        self._fillTestRunFromXml()
+
+    def _applySubstitutes(self, string):
+        for old, new in self.substitutes.iteritems():
+            if old in string:
+                string = string.replace(old, new)
+        return string
+
+    def _getGenerator(self, node):
+        str_instantiator = node.attrib["type"] + "(" + node.attrib["args"] + ")"
+        str_instantiator = self._applySubstitutes(str_instantiator)
+        try:
+            debug ("Creating %s", str_instantiator)
+            gen = eval (str_instantiator)
+        except Exception, e:
+            error("Could not instantiate %s, reason: %s",
+                    str_instantiator, e)
+            return None
+
+        if not isinstance(gen, Generator):
+            error("%s is not a generator type", arg.attrib["type"])
+            return None
+
+        return gen
+
+    def _fillTestRunFromXml(self):
+
+        standard_monitor = []
+        monitorsn = self._root.find("monitors")
+        if monitorsn is not None:
+            for monitor in monitorsn.findall("monitor"):
+                standard_monitor.append((getMonitorClass(monitor.attrib["type"]),
+                            eval('{' + monitor.attrib["args"] + '}')))
+
+        for testn in self._root.findall("test"):
+            monitors = [mon for mon in standard_monitor]
+            monitorsn = testn.find("monitors")
+            if monitorsn is not None:
+                for monitor in monitorsn.findall("monitor"):
+                    monitors.append((getMonitorClass(self._applySubstitutes (monitor.attrib["type"])),
+                                eval('{' + self._applySubstitutes (monitor.attrib["args"]) + '}')))
+
+            for occ in testn.findall("occurrence"):
+                test_args = []
+                test = get_test_metadata(testn.attrib["name"])
+                test_arguments = {}
+                test_kwargs = {}
+                for arg in occ.findall("argument"):
+                    gen = self._getGenerator(arg)
+                    if not gen:
+                        break
+
+                    test_arguments[arg.attrib["name"]] = gen
+
+                e_failures = []
+                for expected_failure in occ.findall("expected-failures"):
+                    checkitems = expected_failure.findall("checkitem")
+                    efail = {}
+                    results = {}
+                    for item in checkitems:
+                        results[item.attrib["name"]] = item.attrib['values']
+
+                    efail["results"] = results
+
+                    args = expected_failure.findall("arguments")
+                    if args:
+                        arguments = {}
+                        for arg in args:
+                            gen = self._getGenerator(arg)
+                            vals = gen.generate()
+                            arguments[item.attrib['name']] = vals
+                        efail["arguments"] = results
+
+                    e_failures.append(efail)
+
+                if e_failures:
+                    test_kwargs['expected-failures'] = e_failures
+                try:
+                    self.addTest(test, arguments=test_arguments, monitors=monitors, kwargs=test_kwargs)
+                except Exception, e:
+                    warning("Could not add %s with arguments %s and montors %s. Reason %s",
+                        test, test_arguments, monitors, e)
+
 
 def single_test_run(test, arguments=[], monitors=None):
     """

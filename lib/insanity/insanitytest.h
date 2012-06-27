@@ -93,7 +93,7 @@ struct _InsanityTestClass
 GType insanity_test_get_type (void);
 
 InsanityTest *insanity_test_new(const char *name, const char *description, const char *full_description);
-void insanity_test_add_checklist_item(InsanityTest *test, const char *label, const char *description, const char *error_hint);
+void insanity_test_add_checklist_item(InsanityTest *test, const char *label, const char *description, const char *error_hint, gboolean global);
 void insanity_test_add_argument(InsanityTest *test, const char *label, const char *description, const char *full_description, gboolean global, const GValue *default_value);
 void insanity_test_add_output_file(InsanityTest *test, const char *label, const char *description, gboolean global);
 void insanity_test_add_extra_info(InsanityTest *test, const char *label, const char *description);
@@ -101,6 +101,7 @@ void insanity_test_add_extra_info(InsanityTest *test, const char *label, const c
 gboolean insanity_test_get_argument(InsanityTest *test, const char *label, GValue *value);
 const char *insanity_test_get_output_filename(InsanityTest *test, const char *label);
 void insanity_test_done(InsanityTest *test);
+gboolean insanity_test_checklist_item_set_global(InsanityTest *test, const char *label, gboolean global);
 void insanity_test_validate_checklist_item(InsanityTest *test, const char *label, gboolean success, const char *description);
 void insanity_test_set_extra_info(InsanityTest *test, const char *label, const GValue *data);
 void insanity_test_ping(InsanityTest *test);

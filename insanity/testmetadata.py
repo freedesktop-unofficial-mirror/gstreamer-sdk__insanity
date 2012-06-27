@@ -80,7 +80,8 @@ class TestMetadata():
             process.stdout.close()
             signal.signal(signal.SIGALRM, old_handler)
             exception("Timeout running possible test '%r'", filename)
-            return FALSE
+            return False
+
         signal.signal(signal.SIGALRM, old_handler)
         signal.alarm(0)
 
@@ -130,6 +131,7 @@ class TestMetadata():
         The format of the returned argument dictionary is:
         key : checklist name
         value : dictionary with :
+            global: if this is a global checklist item
             description: short description
             likely_error: The likely error
         """

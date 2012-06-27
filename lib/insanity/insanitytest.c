@@ -216,6 +216,8 @@ typedef struct _Argument
 
 typedef struct _ChecklistItem
 {
+  gboolean global;
+  char *label;
   char *description;
   char *likely_error;
 } ChecklistItem;
@@ -241,6 +243,7 @@ free_checklist_item (void *ptr)
 {
   ChecklistItem *i = ptr;
 
+  g_free (i->label);
   g_free (i->description);
   g_free (i->likely_error);
 
@@ -527,6 +530,44 @@ insanity_test_ping_unlocked (InsanityTest * test)
 }
 
 /**
+ * insanity_test_checklist_item_set_global:
+ * @test: a #InsanityTest to operate on
+ * @label: the label of the checklist item
+ * @global: the new value for global
+ *
+ * Sets whether a given checklist item is global.
+ *
+ * Returns: TRUE if the item was found, FALSE otherwise.
+ */
+gboolean
+insanity_test_checklist_item_set_global (InsanityTest * test, const char *label,
+    gboolean global)
+{
+  ChecklistItem *item;
+  gboolean ret = FALSE;
+
+  g_return_val_if_fail (INSANITY_IS_TEST (test), FALSE);
+  g_return_val_if_fail (test->priv->runlevel == rl_idle, FALSE);
+  g_return_val_if_fail (label != NULL, FALSE);
+  g_return_val_if_fail (check_valid_label (label), FALSE);
+  g_return_val_if_fail (g_hash_table_lookup (test->priv->test_checklist,
+          label) != NULL, FALSE);
+
+  LOCK (test);
+
+  item = g_hash_table_lookup (test->priv->test_checklist, label);
+  if (!item)
+    goto done;
+
+  item->global = global;
+  ret = TRUE;
+
+done:
+  UNLOCK (test);
+  return ret;
+}
+
+/**
  * insanity_test_validate_checklist_item:
  * @test: a #InsanityTest to operate on
  * @label: the label of the checklist item
@@ -541,6 +582,9 @@ void
 insanity_test_validate_checklist_item (InsanityTest * test, const char *label,
     gboolean success, const char *description)
 {
+  const ChecklistItem *item;
+  gpointer cur_success;
+
   g_return_if_fail (INSANITY_IS_TEST (test));
   g_return_if_fail (label != NULL);
   g_return_if_fail (check_valid_label (label));
@@ -549,14 +593,23 @@ insanity_test_validate_checklist_item (InsanityTest * test, const char *label,
 
   LOCK (test);
 
+  item = g_hash_table_lookup (test->priv->test_checklist, label);
+  if (!item->global &&test->priv->runlevel != rl_started
+      && test->priv->runlevel != rl_setup) {
+    g_critical ("Non-global checklist item '%s' requested to validate but "
+        "not set up yet\n", label);
+    goto done;
+  }
+
   insanity_test_ping_unlocked (test);
 
-  /* if the item has already been (in)validated, then we invalidate if success is FALSE,
-     and do nothing if success is TRUE. This ends up doing a AND operation on all booleans
+  /* if the item has already been invalidated, then we do nothing.
+     This ends up doing a AND operation on all booleans
      passed for that checklist item (ie, a checklist item succeeds only if all calls to
      validate for that item succeed, and fails if any call to validate for that item fails). */
-  if (g_hash_table_lookup (test->priv->checklist_results, label) != NULL) {
-    if (success) {
+  if ((cur_success =
+          g_hash_table_lookup (test->priv->checklist_results, label)) != NULL) {
+    if (!GPOINTER_TO_UINT (cur_success)) {
       UNLOCK (test);
       return;
     }
@@ -578,7 +631,9 @@ insanity_test_validate_checklist_item (InsanityTest * test, const char *label,
   }
 
   g_hash_table_insert (test->priv->checklist_results, g_strdup (label),
-      (success ? ((gpointer) 1) : ((gpointer) 0)));
+      (success ? GUINT_TO_POINTER (1) : GUINT_TO_POINTER (0)));
+
+done:
   UNLOCK (test);
 }
 
@@ -733,9 +788,9 @@ insanity_test_done (InsanityTest * test)
 static gboolean
 on_setup (InsanityTest * test)
 {
-  GValue log_level = { 0 };
   gboolean ret = TRUE;
-  const char *log_level_string, *ptr;
+  const gchar *ptr;
+  gchar *log_level;
 
   LOCK (test);
   if (test->priv->runlevel != rl_idle) {
@@ -744,10 +799,9 @@ on_setup (InsanityTest * test)
   }
   UNLOCK (test);
 
-  insanity_test_get_argument (test, "log-level", &log_level);
+  insanity_test_get_string_argument (test, "log-level", &log_level);
   LOCK (test);
-  log_level_string = g_value_get_string (&log_level);
-  for (ptr = log_level_string; *ptr;) {
+  for (ptr = log_level; *ptr;) {
     const char *colon, *end, *slev;
     char *category = NULL, *lptr = NULL;
     unsigned long level;
@@ -787,7 +841,6 @@ on_setup (InsanityTest * test)
     ptr = *end ? end + 1 : end;
   }
   UNLOCK (test);
-  g_value_unset (&log_level);
 
   g_signal_emit (test, setup_signal, 0, &ret);
 
@@ -1463,6 +1516,7 @@ output_checklist_table (InsanityTest * test, FILE * f)
 
     fprintf (f, "%s    \"%s\" : \n", comma, label);
     fprintf (f, "    {\n");
+    fprintf (f, "        \"global\" : %s,\n", (i->global ? "true" : "false"));
     fprintf (f, "        \"description\" : \"%s\"", i->description);
     if (i->likely_error) {
       fprintf (f, ",\n        \"likely_error\" : \"%s\"", i->likely_error);
@@ -2143,6 +2197,7 @@ insanity_add_metadata_entry (GHashTable * hash, const char *label,
  * @label: the new checklist item's label
  * @description: a one line description of that item
  * @error_hint: (allow-none): an optional explanatory description of why this error may happen
+ * @global: if this is a global item
  *
  * This function adds a checklist item declaration to the test.
  *
@@ -2151,11 +2206,12 @@ insanity_add_metadata_entry (GHashTable * hash, const char *label,
  */
 void
 insanity_test_add_checklist_item (InsanityTest * test, const char *label,
-    const char *description, const char *error_hint)
+    const char *description, const char *error_hint, gboolean global)
 {
   ChecklistItem *i;
 
   g_return_if_fail (INSANITY_IS_TEST (test));
+  g_return_if_fail (test->priv->runlevel == rl_idle);
   g_return_if_fail (label != NULL);
   g_return_if_fail (check_valid_label (label));
   g_return_if_fail (description != NULL);
@@ -2163,8 +2219,10 @@ insanity_test_add_checklist_item (InsanityTest * test, const char *label,
           label) == NULL);
 
   i = g_slice_new (ChecklistItem);
+  i->label = g_strdup (label);
   i->description = g_strdup (description);
   i->likely_error = g_strdup (error_hint);
+  i->global = global;
 
   g_hash_table_insert (test->priv->test_checklist, g_strdup (label), i);
 }
@@ -2199,6 +2257,7 @@ insanity_test_add_argument (InsanityTest * test, const char *label,
   Argument *arg;
 
   g_return_if_fail (INSANITY_IS_TEST (test));
+  g_return_if_fail (test->priv->runlevel == rl_idle);
   g_return_if_fail (label != NULL);
   g_return_if_fail (check_valid_label (label));
   g_return_if_fail (g_hash_table_lookup (test->priv->test_arguments,
@@ -2372,8 +2431,6 @@ insanity_test_logv (InsanityTest * test, const char *category,
   g_return_if_fail (INSANITY_IS_TEST (test));
   g_return_if_fail (check_valid_label (category));
 
-  if (!test->priv->standalone)
-    return;
   if (level == INSANITY_LOG_LEVEL_NONE)
     return;
   if (level > find_log_level (test, category))
@@ -2383,9 +2440,10 @@ insanity_test_logv (InsanityTest * test, const char *category,
 
   msg = g_strdup_vprintf (format, args);
 
-  printf ("%" TIME_FORMAT "\t%p\t%s\t%s\t%s:%u\t%s",
+  g_printerr ("%" TIME_FORMAT "\t%p\t%s\t%s\t%s:%u\t%s",
       TIME_ARGS (dt), g_thread_self (), log_level_names[level], category, file,
       line, msg);
+
   g_free (msg);
 }
 

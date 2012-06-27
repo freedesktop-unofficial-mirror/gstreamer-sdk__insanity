@@ -26,17 +26,15 @@ DBus Test Class
 import os
 import sys
 import subprocess
-import resource
-import signal
 import time
 import dbus
-import dbus.gobject_service
+from insanity.threads import RedirectTerminalOuputThread
 from insanity.test import Test
 from insanity.dbustools import unwrap
 from insanity.log import error, warning, debug, info, exception
 import insanity.utils as utils
 import gobject
-import re
+
 
 class DBusTest(Test, dbus.service.Object):
     """
@@ -65,7 +63,7 @@ class DBusTest(Test, dbus.service.Object):
     __test_extra_infos__ = {
     "subprocess-return-code":"The exit value returned by the subprocess",
     "subprocess-spawn-time":"How long it took to spawn the subprocess (in milliseconds)",
-    "cpu-load" : "CPU load in percent (can exceed 100% on multi core systems)" # TODO: move to C
+    "cpu-load": "CPU load in percent (can exceed 100% on multi core systems)" # TODO: move to C
     }
 
     __test_arguments__ = {
@@ -144,13 +142,14 @@ class DBusTest(Test, dbus.service.Object):
         self._stdin = None
         self._stdout = None
         self._stderr = None
+        self._redir_tty_thread = None
         self._preargs = []
         self._environ = env or {}
         self._environ.update(os.environ.copy())
         self._subprocessspawntime = 0
         self._subprocessconnecttime = 0
         self._pid = 0
-        
+
     # Test class overrides
 
     def test(self):
@@ -185,11 +184,13 @@ class DBusTest(Test, dbus.service.Object):
             self._subprocessspawntime = time.time()
             self._process = subprocess.Popen(pargs,
                                              stdin = self._stdin,
-                                             stdout = self._stdout,
-                                             stderr = self._stderr,
+                                             stdout = subprocess.PIPE,
+                                             stderr = subprocess.PIPE,
                                              env=self._environ,
                                              shell = shell,
                                              cwd=cwd)
+
+            self._ensureOutRedirection()
             self._pid = self._process.pid
         except:
             exception("Error starting the subprocess command ! %r", pargs)
@@ -209,7 +210,7 @@ class DBusTest(Test, dbus.service.Object):
             return False
         return self.callRemoteStart()
 
-    def tearDown(self):
+    def tearDownVmethod(self):
         info("uuid:%s", self.uuid)
         # FIXME : tear down the other process gracefully
         #    by first sending it the termination remote signal
@@ -233,12 +234,25 @@ class DBusTest(Test, dbus.service.Object):
                 if self._returncode is None:
                     self._returncode = utils.kill_process (self._process)
                 self._process = None
+                if self._redir_tty_thread is not None:
+                    self._redir_tty_thread.exit()
+                    self._redir_tty_thread = None
             if not self._returncode is None:
                 info("Process returned %d", self._returncode)
                 self.extraInfo("subprocess-return-code", self._returncode)
+
             self.validateChecklistItem("subprocess-exited-normally", self._returncode == 0)
 
-        Test.tearDown(self)
+    def _ensureOutRedirection(self):
+        if self._redir_tty_thread is None and self._process is not None \
+            and (self._stdout or self._stderr):
+            self._redir_tty_thread = RedirectTerminalOuputThread(self._process,
+                    self._stdout, self._stderr)
+            self._redir_tty_thread.start()
+        elif self._redir_tty_thread is not None and \
+            (self._stderr is None and self._stdout is None):
+            self._redir_tty_thread.exit()
+            self._redir_tty_thread = None
 
     def stop(self):
         info("uuid:%s", self.uuid)
@@ -274,6 +288,9 @@ class DBusTest(Test, dbus.service.Object):
         info("subprocess returned %r" % res)
         self._returncode = res
         self._process = None
+        if self._redir_tty_thread is not None:
+            self._redir_tty_thread.abort()
+            self._redir_tty_thread = None
         self._processpollid = 0
         self.stop()
         return False
@@ -299,6 +316,7 @@ class DBusTest(Test, dbus.service.Object):
     def _voidRemoteStopCallBackHandler(self):
         info("%s", self.uuid)
 
+        self.validateChecklistItem("subprocess-exited-normally")
         self._prepareArguments()
         Test.stop(self)
 
@@ -330,6 +348,28 @@ class DBusTest(Test, dbus.service.Object):
         self._voidRemoteErrBackHandler(exc, "remoteTearDown", fatal=False)
 
 
+    # Stdin and stderr setters
+    def setStderr(self, stderr):
+        self._stderr = stderr
+        self._ensureOutRedirection()
+        if self._redir_tty_thread is not None:
+            self._redir_tty_thread.setStderrFile(stderr)
+
+    def setStdout(self, stdout):
+        self._stderr = stdout
+        self._ensureOutRedirection()
+        if self._redir_tty_thread is not None:
+            self._redir_tty_thread.setStdoutFile(stdout)
+
+    def setStdOutAndErr(self, stderr_out_path):
+        debug("New path: %s", stderr_out_path)
+        self._stdout = stderr_out_path
+        self._stderr = self._stdout
+        self._ensureOutRedirection()
+        if self._redir_tty_thread is not None:
+            self._redir_tty_thread.setStdoutFile(stderr_out_path)
+            self._redir_tty_thread.setStderrFile(stderr_out_path)
+
     ## Proxies for remote DBUS calls
     def callRemoteSetUp(self):
         # call remote instance "remoteSetUp()"
@@ -339,6 +379,7 @@ class DBusTest(Test, dbus.service.Object):
         args = dict((k, v) for k, v in self.args.items() if (k in self.getFullArgumentList() and self.getFullArgumentList()[k]["global"] == True))
         args = self._parse_test_arguments(args)
 
+        debug("Setting up remote with argunents %s outputfiles %s", args, self.getOutputFiles())
         self._remoteinstance.remoteSetUp(args, self.getOutputFiles(),
                                          reply_handler=self._voidRemoteSetUpCallBackHandler,
                                          error_handler=self._voidRemoteSetUpErrBackHandler)
@@ -349,6 +390,7 @@ class DBusTest(Test, dbus.service.Object):
             return
 
         self.args = self._parse_test_arguments(self.args)
+        debug("Starting remote with argunents %s outputfiles %s", self.args, self.getOutputFiles())
         self._remoteinstance.remoteStart(self.args, self.getOutputFiles(),
                                          reply_handler=self._voidRemoteStartCallBackHandler,
                                          error_handler=self._voidRemoteStartErrBackHandler)
