@@ -507,14 +507,15 @@ class TerminalRedirectionMonitor(Monitor):
         " output file",
         "outputfile-basename":"The category of outputfiles (default='')",
         "category":"The category of outputfiles (default='insanity-output')",
-        "compress-outputfiles":"Whether the resulting output should be compressed (default:True)"
+        "compress-outputfiles":"Whether the resulting output should be compressed (default:True)",
+        "one-file-per-iteration":"Whether it outputs one file per iteration of start/stop or not (default: False)"
         }
     __monitor_output_files__ = {
-        "glob-stdout-and-stderr-file":"File with both stderr and stdout used between"
+        "global-stdout-and-stderr-file":"File with both stderr and stdout used between"
             " setup and first start iteration and last stop and teardown",
-        "glob-stdout-file":"File with stdout used between setup and first start "
+        "global-stdout-file":"File with stdout used between setup and first start "
             "iteration and last stop and teardown",
-        "glob-stderr-file":"File with stderr used between setup and first start"
+        "global-stderr-file":"File with stderr used between setup and first start"
             " iteration and last stop and teardown",
         "stdout-and-stderr-file":"File with both stderr and stdout",
         "stdout-file":"File with stdout only",
@@ -524,15 +525,29 @@ class TerminalRedirectionMonitor(Monitor):
 
     def setUp(self):
         Monitor.setUp(self)
-        self._files, self._paths = self._start()
+        self._files, self._paths = self._start(True)
         for desc, path in self._paths.iteritems():
-            self.setOutputFile("glob-" + desc, self._compressFile(path, False))
+            self.setOutputFile("global-" + desc, self._compressFile(path, False))
         self._it_files = []
         self._it_paths = []
 
         return True
 
-    def _start(self):
+    def _getTempFiles(self, basename, default_name, glob, category):
+        if basename is None:
+            nameid = default_name
+        else:
+            nameid = basename
+
+        if glob:
+            nameid = "global-" + nameid
+
+        if category:
+            return self.testrun.get_temp_file(nameid=nameid, category=category)
+        else:
+            return self.testrun.get_temp_file(nameid=nameid)
+
+    def _start(self, glob):
         desc = self.arguments.get("desc")
         basename = self.arguments.get("outputfile-basename")
         category = self.arguments.get("category")
@@ -547,43 +562,20 @@ class TerminalRedirectionMonitor(Monitor):
                 return False
 
             if 'stderr' in desc:
-                if basename is None:
-                    nameid = "stderr"
-                else:
-                    nameid = basename
-
-                if category:
-                    stderr_file, stderr_path = self.testrun.get_temp_file(nameid=nameid, category=category)
-                else:
-                    stderr_file, stderr_path = self.testrun.get_temp_file(nameid=nameid)
+                stderr_file, stderr_path = self._getTempFiles(basename, "stderr", glob, category)
 
                 self.test.setStderr(stderr_file)
                 files.append(stderr_file)
                 paths["stderr-file"] = stderr_path
 
             if 'stdout' in desc:
-                if basename is None:
-                    nameid = "stdout"
-                else:
-                    nameid = basename
-                if category:
-                    stdout_file, stdout_path = self.testrun.get_temp_file(nameid=nameid, category=category)
-                else:
-                    stdout_file, stdout_path = self.testrun.get_temp_file(nameid=nameid)
+                stdout_file, stdout_path = self._getTempFiles(basename, "stdout", glob, category)
 
                 self.test.setStdout(stdout_file)
                 files.append(stdout_file)
                 paths["stdout-file"] = stdout_path
         else:
-            if basename is None:
-                nameid = "stdoutanderr"
-            else:
-                nameid = basename
-
-            if category:
-                _file, path = self.testrun.get_temp_file(nameid=nameid, category=category)
-            else:
-                _file, path = self.testrun.get_temp_file(nameid=nameid)
+            _file, path = self._getTempFiles(basename, "stdoutanderr", glob, category)
 
             self.test.setStdOutAndErr(path)
             files.append(_file)
@@ -592,15 +584,22 @@ class TerminalRedirectionMonitor(Monitor):
         return files, paths
 
     def start(self, iteration):
+        if not self.arguments.get("one-file-per-iteration", False):
+            return
+
         Monitor.start(self, iteration)
-        self._it_files, self._it_paths = self._start()
+        self._it_files, self._it_paths = self._start(False)
         return True
 
     def stop(self):
+        if not self.arguments.get("one-file-per-iteration", False):
+            return
+
         Monitor.stop(self)
         for f in self._it_files:
             os.close(f)
         self._stop(self._it_paths)
+        return True
 
     def _compressFile(self, path, for_real=True):
         """
@@ -609,7 +608,7 @@ class TerminalRedirectionMonitor(Monitor):
         the file will land when compressed.
         """
         res = path
-        if self.arguments.get("compress", True):
+        if self.arguments.get("compress-outputfiles", True):
 
             if not res.endswith(".gz"):
                 res = path + ".gz"
